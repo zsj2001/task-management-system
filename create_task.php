@@ -1,0 +1,825 @@
+<?php
+session_start();
+
+require_once 'db.php';
+
+$message = '';
+$error = '';
+
+// Check if editing an existing task
+$tID = (int)($_GET['tID'] ?? 0);
+$isEdit = $tID > 0;
+$task = null;
+$existingAttachments = [];
+
+$back = $_GET['back'] ?? ($_POST['back'] ?? '');
+$backSuffix = $back !== '' ? ('&back=' . urlencode($back)) : '';
+
+if ($isEdit) {
+    // Fetch Task Details
+    $stmt = $pdo->prepare("
+        SELECT 
+            t.*, 
+            tp_req.pID as req_pID,
+            e_req.deptID as req_deptID,
+            d_req.lID as req_lID,
+            l_req.oID as req_oID,
+            tp_target.pID as target_pID,
+            e_target.deptID as target_deptID,
+            d_target.lID as target_lID,
+            l_target.oID as target_oID
+        FROM task t
+        LEFT JOIN task_party tp_req ON t.tID = tp_req.tID AND tp_req.role = 'REQUESTOR'
+        LEFT JOIN party p_req ON tp_req.pID = p_req.pID
+        LEFT JOIN employee e_req ON p_req.eID = e_req.eID
+        LEFT JOIN department d_req ON e_req.deptID = d_req.deptID
+        LEFT JOIN location l_req ON d_req.lID = l_req.lID
+        LEFT JOIN task_party tp_target ON t.tID = tp_target.tID AND tp_target.role = 'TARGET'
+        LEFT JOIN party p_target ON tp_target.pID = p_target.pID
+        LEFT JOIN employee e_target ON p_target.eID = e_target.eID
+        LEFT JOIN department d_target ON e_target.deptID = d_target.deptID
+        LEFT JOIN location l_target ON d_target.lID = l_target.lID
+        WHERE t.tID = :tID
+    ");
+    $stmt->execute(['tID' => $tID]);
+    $task = $stmt->fetch();
+
+    if (!$task) {
+        die("Task not found.");
+    }
+
+    // Fetch existing attachment
+    $stmtAtt = $pdo->prepare("
+        SELECT *
+        FROM task_attachment
+        WHERE tID = :tID
+        ORDER BY uploaded_at
+    ");
+    $stmtAtt->execute(['tID' => $tID]);
+    $existingAttachments = $stmtAtt->fetchAll();
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    try {
+        $pdo->beginTransaction();
+        // get form values
+        $urg_id         = (int)$_POST['urgID'];
+        $request_date   = $_POST['request_date'];
+        $title          = trim($_POST['tTitle']);
+        $desc           = trim($_POST['tDesc']);
+        $creator_eID    = (int)$_POST['created_by_eID'];
+        $target_pID     = (int)$_POST['target_pID'];
+        $target_lID    = (int)$_POST['target_lID'];
+        $target_deptID = (int)$_POST['target_deptID'];
+        $category_id    = !empty($_POST['tcID']) ? (int)$_POST['tcID'] : null;
+
+        // validate target org → dept → employee
+        $stmtTarget = $pdo->prepare("
+            SELECT p.pID
+            FROM party p
+            INNER JOIN employee e ON p.eID = e.eID
+            INNER JOIN department d ON e.deptID = d.deptID
+            WHERE p.pID = :pID
+              AND p.pType = 'EMPLOYEE'
+              AND e.deptID = :deptID
+              AND d.lID = :lID
+              AND e.is_active = 1
+            LIMIT 1
+        ");
+
+        $stmtTarget->execute([
+            'pID'    => $target_pID,
+            'deptID' => $target_deptID,
+            'lID'    => $target_lID
+        ]);
+
+        if (!$stmtTarget->fetch()) {
+            throw new Exception('Invalid target organization, location, department, or employee.');
+        }
+
+        if ($isEdit) {
+            // Update existing Task
+            $stmtTask = $pdo->prepare("
+                UPDATE task 
+                SET lID = :lID, 
+                    urgID = :urgID, 
+                    tcID = :tcID, 
+                    created_by_eID = :created_by_eID, 
+                    request_date = :request_date, 
+                    tTitle = :tTitle, 
+                    tDesc = :tDesc 
+                WHERE tID = :tID
+            ");
+            $stmtTask->execute([
+                'lID'            => $target_lID,
+                'urgID'          => $urg_id,
+                'tcID'           => $category_id,
+                'created_by_eID' => $creator_eID,
+                'request_date'   => $request_date,
+                'tTitle'         => $title,
+                'tDesc'          => $desc,
+                'tID'            => $tID
+            ]);
+
+            // Update Task Parties (Requestor & Target)
+            $stmtParty = $pdo->prepare("SELECT pID FROM party WHERE eID = :eID LIMIT 1");
+            $stmtParty->execute(['eID' => $creator_eID]);
+            $requestor_pID = $stmtParty->fetchColumn();
+
+            // Clear old roles
+            $pdo->prepare("DELETE FROM task_party WHERE tID = :tID")->execute(['tID' => $tID]);
+
+            // Insert updated roles
+            $stmtTP = $pdo->prepare("INSERT INTO task_party (tID, pID, role) VALUES (:tID, :pID, :role)");
+            if ($requestor_pID) {
+                $stmtTP->execute(['tID' => $tID, 'pID' => $requestor_pID, 'role' => 'REQUESTOR']);
+            }
+            if ($target_pID) {
+                $stmtTP->execute(['tID' => $tID, 'pID' => $target_pID, 'role' => 'TARGET']);
+            }
+
+            // DELETE SELECTED ATTACHMENTS
+            if (!empty($_POST['delete_attachments']) && is_array($_POST['delete_attachments'])) {
+                $deleteAttachment = $pdo->prepare("
+                    SELECT file_name
+                    FROM task_attachment
+                    WHERE attID = :attID
+                    AND tID = :tID
+                    LIMIT 1
+                ");
+
+                $deleteAttachmentDB = $pdo->prepare("DELETE FROM task_attachment WHERE attID = :attID AND tID = :tID");
+
+                foreach ($_POST['delete_attachments'] as $attachmentID) {
+                    $attachmentID = (int)$attachmentID;
+
+                    if ($attachmentID <= 0) {
+                        continue;
+                    }
+
+                    $deleteAttachment->execute([
+                        'attID' => $attachmentID,
+                        'tID'  => $tID
+                    ]);
+
+                    $fileName = $deleteAttachment->fetchColumn();
+
+                    if ($fileName) {
+                        $deleteAttachmentDB->execute([
+                        'attID' => $attachmentID,
+                        'tID'  => $tID
+                    ]);
+
+                    $filePath = __DIR__ . '/uploads/' . basename($fileName);
+
+                    if (is_file($filePath)) {
+                        unlink($filePath);
+                    }
+                    }
+                }
+            }
+
+            // Handle Attachment Upload for Edit
+            if (isset($_FILES['attachment']) && $_FILES['attachment']['error'] !== UPLOAD_ERR_NO_FILE) {
+                $file = $_FILES['attachment'];
+
+                // Check upload error
+                if ($file['error'] !== UPLOAD_ERR_OK) {
+                    throw new Exception('There was an error uploading the image.');
+                }
+
+                // Maximum file size = 5 MB
+                $maxFileSize = 5 * 1024 * 1024;
+                if ($file['size'] > $maxFileSize) {
+                    throw new Exception('Image size must not exceed 5 MB.');
+                }
+
+                // Allowed MIME types
+                $allowedMimeTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+
+                // Detect actual MIME type
+                $finfo = new finfo(FILEINFO_MIME_TYPE);
+                $mimeType = $finfo->file($file['tmp_name']);
+
+                // Check MIME type
+                if (!in_array($mimeType, $allowedMimeTypes, true)) {
+                    throw new Exception('Only JPG, PNG, GIF, and WebP image files are allowed.');
+                }
+
+                // Verify actual image
+                if (@getimagesize($file['tmp_name']) === false) {
+                    throw new Exception('The uploaded file is not a valid image.');
+                }
+
+                // Create upload directory
+                $uploadDir = __DIR__ . '/uploads/';
+                if (!is_dir($uploadDir)) {
+                    if (!mkdir($uploadDir, 0755, true)) {
+                        throw new Exception('Unable to create upload directory.');
+                    }
+                }
+
+                // Generate filename
+                $finfo = new finfo(FILEINFO_MIME_TYPE);
+                $mimeType = $finfo->file($file['tmp_name']);
+
+                $mimeToExtension = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/gif' => 'gif', 'image/webp' => 'webp'];
+
+                if (!isset($mimeToExtension[$mimeType])) {
+                    throw new Exception('Only JPG, PNG, GIF, and WebP image files are allowed.');
+                }
+                $fileName = bin2hex(random_bytes(4)) . '.' . $mimeToExtension[$mimeType];
+                $targetFilePath = $uploadDir . $fileName;
+
+                // Move uploaded file
+                if (!move_uploaded_file($file['tmp_name'], $targetFilePath)) {
+                    throw new Exception('Failed to save the uploaded image.');
+                }
+
+                // Save attachment in database
+                $stmtAtt = $pdo->prepare("
+                    INSERT INTO task_attachment(tID, uploaded_by_eID, file_name, uploaded_at)
+                    VALUES(:tID, :eID, :file_name, NOW())
+                ");
+
+                $stmtAtt->execute([
+                    'tID'       => $tID,
+                    'eID'       => $creator_eID,
+                    'file_name' => $fileName
+                ]);
+            }
+
+            $pdo->commit();
+            $_SESSION['success_message'] = 'Task Updated Successfully';
+            header("Location: view_task.php?tID=" . $tID . $backSuffix);
+            exit;
+        } else {
+            // Get 'NEW' status ID
+            $stmtStatus = $pdo->prepare("SELECT sID FROM status WHERE sName = 'NEW' LIMIT 1");
+            $stmtStatus->execute();
+            $status_id = $stmtStatus->fetchColumn() ?: 1;
+
+            // Generate unique Task Number
+            do {
+                $tNo = 'TSK-' . date('Ymd') . '-' . str_pad((string) random_int(1, 99999), 5, '0', STR_PAD_LEFT);
+                $checkTaskNo = $pdo->prepare("SELECT 1 FROM task WHERE tNo = :tNo LIMIT 1");
+                $checkTaskNo->execute(['tNo' => $tNo]);
+            } while ($checkTaskNo->fetchColumn());     
+
+            // Insert Task
+            $stmtTask = $pdo->prepare("
+                INSERT INTO task (tNo, lID, urgID, tcID, created_by_eID, current_sID, request_date, tTitle, tDesc, created_at)
+                VALUES (:tNo, :lID, :urgID, :tcID, :created_by_eID, :current_sID, :request_date, :tTitle, :tDesc, NOW())
+            ");
+            $stmtTask->execute([
+                'tNo'            => $tNo,
+                'lID'            => $target_lID,
+                'urgID'          => $urg_id,
+                'tcID'           => $category_id,
+                'created_by_eID' => $creator_eID,
+                'current_sID'    => $status_id,
+                'request_date'   => $request_date,
+                'tTitle'         => $title,
+                'tDesc'          => $desc
+            ]);
+            $tID = (int)$pdo->lastInsertId();
+
+            // Fetch Creator's Party ID
+            $stmtParty = $pdo->prepare("SELECT pID FROM party WHERE eID = :eID LIMIT 1");
+            $stmtParty->execute(['eID' => $creator_eID]);
+            $requestor_pID = $stmtParty->fetchColumn();
+
+            // Link Requestor & Target Party
+            $stmtTP = $pdo->prepare("INSERT INTO task_party (tID, pID, role) VALUES (:tID, :pID, :role)");
+            if ($requestor_pID) {
+                $stmtTP->execute(['tID' => $tID, 'pID' => $requestor_pID, 'role' => 'REQUESTOR']);
+            }
+            if ($target_pID) {
+                $stmtTP->execute(['tID' => $tID, 'pID' => $target_pID, 'role' => 'TARGET']);
+            }
+
+            // Log Create Action in task_action
+            $stmtAction = $pdo->prepare("
+                INSERT INTO task_action (tID, action_by_eID, sID, tactType, tactRemark, created_at)
+                VALUES (:tID, :eID, :sID, 'CREATE', NULL, NOW())
+            ");
+            $stmtAction->execute([
+                'tID' => $tID,
+                'eID' => $creator_eID,
+                'sID' => $status_id
+            ]);
+
+            // Handle File Uploads for Create
+            if (isset($_FILES['attachment']) && $_FILES['attachment']['error'] !== UPLOAD_ERR_NO_FILE) {
+                $file = $_FILES['attachment'];
+
+                // Check upload error
+                if ($file['error'] !== UPLOAD_ERR_OK) {
+                    throw new Exception('There was an error uploading the image.');
+                }
+
+                // Maximum file size = 5 MB
+                $maxFileSize = 5 * 1024 * 1024;
+                if ($file['size'] > $maxFileSize) {
+                    throw new Exception('Image size must not exceed 5 MB.');
+                }
+
+                // Allowed MIME types
+                $allowedMimeTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+
+                // Detect actual MIME type
+                $finfo = new finfo(FILEINFO_MIME_TYPE);
+                $mimeType = $finfo->file($file['tmp_name']);
+
+                // Check MIME type
+                if (!in_array($mimeType, $allowedMimeTypes, true)) {
+                    throw new Exception('Only JPG, PNG, GIF, and WebP image files are allowed.');
+                }
+
+                // Verify actual image
+                if (@getimagesize($file['tmp_name']) === false) {
+                    throw new Exception('The uploaded file is not a valid image.');
+                }
+
+                // Create upload directory
+                $uploadDir = __DIR__ . '/uploads/';
+                if (!is_dir($uploadDir)) {
+                    if (!mkdir($uploadDir, 0755, true)) {
+                        throw new Exception('Unable to create upload directory.');
+                    }
+                }
+
+                // Generate filename
+                $finfo = new finfo(FILEINFO_MIME_TYPE);
+                $mimeType = $finfo->file($file['tmp_name']);
+
+                $mimeToExtension = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/gif' => 'gif', 'image/webp' => 'webp'];
+
+                if (!isset($mimeToExtension[$mimeType])) {
+                    throw new Exception('Only JPG, PNG, GIF, and WebP image files are allowed.');
+                }
+                $fileName = bin2hex(random_bytes(4)) . '.' . $mimeToExtension[$mimeType];
+                $targetFilePath = $uploadDir . $fileName;
+
+                // Move uploaded file
+                if (!move_uploaded_file($file['tmp_name'], $targetFilePath)) {
+                    throw new Exception('Failed to save the uploaded image.');
+                }
+
+                // Save attachment in database
+                $stmtAtt = $pdo->prepare("
+                    INSERT INTO task_attachment(tID, uploaded_by_eID, file_name, uploaded_at)
+                    VALUES(:tID, :eID, :file_name, NOW())
+                ");
+
+                $stmtAtt->execute([
+                    'tID'       => $tID,
+                    'eID'       => $creator_eID,
+                    'file_name' => $fileName
+                ]);
+            }
+
+            $pdo->commit();
+            $_SESSION['success_message'] = 'Task Created Successfully';
+            header("Location: index.php" . ($back !== '' ? ('&' . $back) : ''));
+            exit;
+        }
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        $error = "Error saving task: " . $e->getMessage();
+    }
+}
+
+// Fetch Dropdown Data
+$organizations = $pdo->query("SELECT oID, oName FROM organization ORDER BY oName")->fetchAll();
+$locations     = $pdo->query("SELECT lID, oID, lName FROM location ORDER BY lName")->fetchAll();
+$urgencies     = $pdo->query("SELECT urgID, urgName FROM urgency")->fetchAll();
+$categories    = $pdo->query("SELECT tcID, tcName FROM task_category ORDER BY tcName")->fetchAll();
+$departments = $pdo->query("SELECT deptID, lID, deptName FROM department ORDER BY deptName")->fetchAll();
+$employees = $pdo->query("SELECT e.eID, e.eName, e.deptID, d.lID, p.pID
+    FROM employee e
+    INNER JOIN department d ON e.deptID = d.deptID
+    INNER JOIN party p
+        ON p.eID = e.eID
+       AND p.pType = 'EMPLOYEE'
+    WHERE e.is_active = 1
+    ORDER BY e.eName
+")->fetchAll();
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title><?= $isEdit ? 'Edit Task' : 'Create Task' ?></title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f4f6f9; }
+        .header { display: flex; justify-content: center;  text-align: center; }
+        .card { background: #fff; padding: 25px; border-radius: 6px; max-width: 700px; margin: 0 auto; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; font-weight: bold; margin-bottom: 5px; }
+        input[type="text"], input[type="date"], select, textarea { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+        .btn { display: inline-flex; align-items: center; justify-content: center; padding: 8px 16px; font-size: 14px; font-weight: 500; color: #fff; background: #2ba3b6; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; box-sizing: border-box; height: 38px; line-height: 1; }
+        .btn-secondary { background: #6c757d; }
+        .error { color: red; margin-bottom: 15px; }
+        .required-asterisk { color: red; }
+        .is-invalid { border-color: #dc3545 !important; background-color: #fff8f8; }
+        .target-row {display: grid; grid-template-columns: repeat(4, 1fr); gap: 25px; width: 100%; }
+        .target-field {  min-width: 0; }
+        .target-field label { font-weight: bold; margin-bottom: 8px; }
+        .target-field select {width: 100%; }
+        .existing-attachments { display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 15px; }
+        .attachment-preview { width: 100%; height: 100%; object-fit: contain; display: block; }
+        .attachment-box { position: relative; width: 150px; height: 120px; border: 1px solid #ccc; border-radius: 5px; background: #f8f9fa; overflow: hidden; }
+        .remove-attachment { position: absolute; top: 5px; right: 5px; z-index: 10; 
+            width: 24px; height: 24px;
+            border: none; border-radius: 50%;
+            background: #dc3545; color: white;
+            font-size: 18px; font-weight: bold; line-height: 22px;
+            padding: 0; cursor: pointer;
+            display: flex; align-items: center; justify-content: center; 
+        }
+        .remove-attachment:hover { background: #b02a37; }
+        @media (max-width: 900px) { .target-row { grid-template-columns: repeat(2, 1fr); gap: 15px; } }
+        @media (max-width: 600px) { .target-row { grid-template-columns: 1fr; gap: 15px; }
+}
+    </style>
+</head>
+
+<body>
+<div class="header">
+    <h2><?= $isEdit ? 'Edit Task (' . htmlspecialchars($task['tNo']) . ')' : 'Create Task' ?></h2>
+</div>
+<div class="card">
+    <?php if ($error): ?><p class="error"><?= htmlspecialchars($error) ?></p><?php endif; ?>
+
+    <form id="createTaskForm" method="POST" enctype="multipart/form-data" novalidate>
+        <div class="form-group">
+            <label>Requestor:</label>
+            <div class="target-row">
+                <div class="target-field">
+                    <label>Organization:<span class="required-asterisk">*</span></label>
+                    <select id="reqOrganizationSelect" required>
+                        <option value=""></option>
+                        <?php foreach ($organizations as $org): ?>
+                            <option value="<?= (int)$org['oID'] ?>" <?= ($isEdit && isset($task['req_oID']) && $task['req_oID'] == $org['oID']) ? 'selected' : '' ?>>
+                                <?= htmlspecialchars($org['oName']) ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div class="target-field">
+                    <label>Location:<span class="required-asterisk">*</span></label>
+                    <select id="reqLocationSelect" required <?= (!$isEdit || empty($task['req_oID'])) ? 'disabled' : '' ?>>
+                        <option value=""></option>
+                        <?php foreach ($locations as $loc): ?>
+                            <option value="<?= (int)$loc['lID'] ?>" data-org-id="<?= (int)$loc['oID'] ?>" <?= ($isEdit && isset($task['req_lID']) && $task['req_lID'] == $loc['lID']) ? 'selected' : '' ?>>
+                                <?= htmlspecialchars($loc['lName']) ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div class="target-field">
+                    <label>Department:<span class="required-asterisk">*</span></label>
+                    <select id="reqDepartmentSelect" required <?= (!$isEdit || empty($task['req_lID'])) ? 'disabled' : '' ?>>
+                        <option value=""></option>
+                        <?php foreach ($departments as $dept): ?>
+                            <option value="<?= (int)$dept['deptID'] ?>" data-location-id="<?= (int)$dept['lID'] ?>" <?= ($isEdit && isset($task['req_deptID']) && $task['req_deptID'] == $dept['deptID']) ? 'selected' : '' ?>>
+                                <?= htmlspecialchars($dept['deptName']) ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div class="target-field">
+                    <label>Employee:<span class="required-asterisk">*</span></label>
+                    <select name="created_by_eID" id="reqEmployeeSelect" required <?= (!$isEdit || empty($task['req_deptID'])) ? 'disabled' : '' ?>>
+                        <option value=""></option>
+                        <?php foreach ($employees as $emp): ?>
+                            <option value="<?= (int)$emp['eID'] ?>" data-dept-id="<?= (int)$emp['deptID'] ?>" <?= ($isEdit && isset($task['created_by_eID']) && $task['created_by_eID'] == $emp['eID']) ? 'selected' : '' ?>>
+                                <?= htmlspecialchars($emp['eName']) ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label>Category:<span class="required-asterisk">*</span></label>
+            <select name="tcID" required>
+                <option value=""></option>
+                <?php foreach ($categories as $cat): ?>   
+                <option
+                    value="<?= $cat['tcID'] ?>" <?= ($isEdit && $task['tcID'] == $cat['tcID']) ? 'selected' : '' ?>>
+                    <?= htmlspecialchars($cat['tcName']) ?>
+                </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label>Urgency:<span class="required-asterisk">*</span></label>
+            <select name="urgID" required>
+                <?php foreach ($urgencies as $urg): ?>
+                    <option value="<?= $urg['urgID'] ?>" <?= ($isEdit && $task['urgID'] == $urg['urgID']) ? 'selected' : '' ?>>
+                        <?= htmlspecialchars($urg['urgName']) ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label>Request Date:<span class="required-asterisk">*</span></label>
+            <input type="date" name="request_date" value="<?= $isEdit ? htmlspecialchars($task['request_date']) : date('Y-m-d') ?>" required>
+        </div>
+
+        <div class="form-group">
+            <label>Target:</label>
+
+            <div class="target-row">
+                <div class="target-field">
+                <label>Organization:<span class="required-asterisk">*</span></label>
+                <select name="target_oID" id="targetOrganizationSelect" required>
+                <option value=""></option>
+                <?php foreach ($organizations as $org): ?>
+                    <option value="<?= (int)$org['oID'] ?>" <?= ($isEdit && isset($task['target_oID']) && $task['target_oID'] == $org['oID']) ? 'selected' : '' ?>>
+                        <?= htmlspecialchars($org['oName']) ?>
+                    </option>
+                <?php endforeach; ?>
+                </select>
+                </div>
+
+                <div class="target-field">
+                    <label>Location:<span class="required-asterisk">*</span></label>
+                    <select name="target_lID" id="targetLocationSelect" required
+                        <?= (!$isEdit || empty($task['target_oID'])) ? 'disabled' : '' ?>>
+                    <option value=""></option>
+                    <?php foreach ($locations as $loc): ?>
+                        <option value="<?= (int)$loc['lID'] ?>"
+                            data-org-id="<?= (int)$loc['oID'] ?>"
+                            <?= ($isEdit && isset($task['target_lID']) && $task['target_lID'] == $loc['lID']) ? 'selected' : '' ?>
+                        >
+                        <?= htmlspecialchars($loc['lName']) ?>
+                        </option>
+                    <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div class="target-field">
+                <label>Department:<span class="required-asterisk">*</span></label>
+                <select name="target_deptID" id="targetDepartmentSelect" required <?= (!$isEdit || empty($task['target_lID'])) ? 'disabled' : '' ?>>
+                <option value=""></option>
+                <?php foreach ($departments as $dept): ?>
+                    <option value="<?= (int)$dept['deptID'] ?>"
+                        data-location-id="<?= (int)$dept['lID'] ?>"
+                        <?= ($isEdit && isset($task['target_deptID']) && $task['target_deptID'] == $dept['deptID']) ? 'selected' : '' ?>
+                    >
+                        <?= htmlspecialchars($dept['deptName']) ?>
+                    </option>
+                <?php endforeach; ?>
+                </select>
+                </div>
+
+                <div class="target-field">
+                <label>Employee:<span class="required-asterisk">*</span></label>
+                <select name="target_pID" id="targetEmployeeSelect" required <?= (!$isEdit || empty(!$task['target_deptID'])) ? 'disabled' : '' ?>>
+                <option value=""></option>
+                <?php foreach ($employees as $emp): ?>
+                    <option value="<?= (int)$emp['pID'] ?>"
+                        data-dept-id="<?= (int)$emp['deptID'] ?>"
+                        <?= ($isEdit && isset($task['target_pID']) && $task['target_pID'] == $emp['pID']) ? 'selected' : '' ?>
+                    >
+                        <?= htmlspecialchars($emp['eName']) ?>
+                    </option>
+                <?php endforeach; ?>
+                </select>
+                </div>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label>Issue Title:<span class="required-asterisk">*</span></label>
+            <input type="text" name="tTitle" value="<?= $isEdit ? htmlspecialchars($task['tTitle']) : '' ?>" required>
+        </div>
+
+        <div class="form-group">
+            <label>Issue Description:<span class="required-asterisk">*</span></label>
+            <textarea name="tDesc" rows="4" required><?= $isEdit ? htmlspecialchars($task['tDesc']) : '' ?></textarea>
+        </div>
+
+        <div class="form-group">
+            <label>Upload Attachment:<?= $isEdit ? '' : '<span class="required-asterisk">*</span>' ?></label>
+
+            <?php if ($isEdit && !empty($existingAttachments)): ?>
+                <div class="existing-attachments">
+                <?php foreach ($existingAttachments as $attachment): ?>
+                    <?php
+                        $fileName = $attachment['file_name'];
+                        $filePath = 'uploads/' . $fileName;
+                        $extension = strtolower(pathinfo($fileName, PATHINFO_EXTENSION));
+                        $imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
+                    ?>
+
+                    <?php if (in_array($extension, $imageExtensions)): ?>
+                        <div class="attachment-box"
+                            data-attachment-id="<?= (int)$attachment['attID'] ?>">
+                            <button type="button" class="remove-attachment" title="Remove attachment" onclick="removeAttachment(this)">
+                                &times;
+                            </button>
+                            <img src="<?= htmlspecialchars($filePath) ?>" alt="Attachment" class="attachment-preview">
+                        </div>
+                    <?php endif; ?>
+                <?php endforeach; ?>
+                </div>
+            <?php endif; ?>
+
+            <div id="deletedAttachments"></div>
+            <input type="file" name="attachment" accept="image/jpeg,image/png,image/gif,image/webp"<?= $isEdit ? '' : 'required' ?>>
+            <small style="display:block; margin-top:5px; color:#666;">Allowed file: .jpg, .jpeg, .png, .gif, .webp. Maximum 5 MB.</small>
+        </div>
+
+        <div style="display: flex; gap: 10px; align-items: center; margin-top: 20px;">
+            <button type="submit" class="btn"><?= $isEdit ? 'Update' : 'Create' ?></button>
+            <a href="<?= $isEdit ? ('view_task.php?tID=' . $tID . $backSuffix) : ('index.php' . ($back !== '' ? ('?' . $back) : '')) ?>" class="btn btn-secondary">Cancel</a>
+        </div>
+    </form>
+</div>
+
+<script>
+document.getElementById('createTaskForm').addEventListener('submit', function(e) {
+    const requiredInputs = this.querySelectorAll('[required]');
+    let hasError = false;
+
+    // Reset red highlights
+    requiredInputs.forEach(input => input.classList.remove('is-invalid'));
+
+    // Check each required input
+    requiredInputs.forEach(input => {
+        if (input.type === 'file') {
+            if (!input.files || input.files.length === 0) {
+                // If editing and attachment already exists, file input is optional
+                if (!<?= $isEdit ? 'true' : 'false' ?>) {
+                    input.classList.add('is-invalid');
+                    hasError = true;
+                }
+            }
+        } else if (!input.value.trim()) {
+            input.classList.add('is-invalid');
+            hasError = true;
+        }
+    });
+
+    // Client-side image validation
+    const fileInput = document.querySelector('input[name="attachment"]');
+
+    if (fileInput && fileInput.files && fileInput.files.length > 0) {
+        const file = fileInput.files[0];
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp' ];
+        const maxSize = 5 * 1024 * 1024;
+
+        // Check file type
+       if (!allowedTypes.includes(file.type)) {
+            fileInput.classList.add('is-invalid');
+            hasError = true;
+            alert('Only JPG, PNG, GIF, and WebP image files are allowed.');
+        }
+
+        // Check file size
+        if (file.size > maxSize) {
+            fileInput.classList.add('is-invalid');
+            hasError = true;
+            alert('Image size must not exceed 5 MB.');
+        }
+    }
+
+    if (hasError) {
+        e.preventDefault();
+        if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
+            alert('All required fields must be filled out.');
+        }
+    }
+});
+
+// Remove red highlight dynamically when input changes
+document.querySelectorAll('#createTaskForm [required]').forEach(input => {
+    input.addEventListener('input', function() {
+        if (this.value.trim()) {
+            this.classList.remove('is-invalid');
+        }
+    });
+    input.addEventListener('change', function() {
+        if (this.value.trim()) {
+            this.classList.remove('is-invalid');
+        }
+    });
+});
+
+// Helper for setup of cascade listener
+function setupCascade(orgSel, locSel, deptSel, empSel) {
+    function filterLocs() {                                // org -> loc
+        const selectedOrgId = orgSel.value;
+        if (!selectedOrgId) {
+            locSel.disabled = true; locSel.value = '';
+            deptSel.disabled = true; deptSel.value = '';
+            empSel.disabled = true; empSel.value = '';
+            return;
+        }
+        locSel.disabled = false;
+        Array.from(locSel.options).forEach(opt => {
+            if (!opt.value) return;
+            opt.hidden = (opt.dataset.orgId !== selectedOrgId);
+        });
+    }
+
+    function filterDepts() {                               // loc -> dept
+        const selectedLocId = locSel.value;
+        if (!selectedLocId) {
+            deptSel.disabled = true; deptSel.value = '';
+            empSel.disabled = true; empSel.value = '';
+            return;
+        }
+        deptSel.disabled = false;
+        Array.from(deptSel.options).forEach(opt => {
+            if (!opt.value) return;
+            opt.hidden = (opt.dataset.locationId !== selectedLocId);
+        });
+    }
+
+    function filterEmps() {                              // dept -> emp
+        const selectedDeptId = deptSel.value;
+        if (!selectedDeptId) {
+            empSel.disabled = true; empSel.value = '';
+            return;
+        }
+        empSel.disabled = false;
+        Array.from(empSel.options).forEach(opt => {
+            if (!opt.value) return;
+            opt.hidden = (opt.dataset.deptId !== selectedDeptId);
+        });
+    }
+
+    orgSel.addEventListener('change', function () {
+        locSel.value = ''; deptSel.value = ''; empSel.value = '';
+        deptSel.disabled = true; empSel.disabled = true;
+        filterLocs();
+    });
+
+    locSel.addEventListener('change', function () {
+        deptSel.value = ''; empSel.value = '';
+        empSel.disabled = true;
+        filterDepts();
+    });
+
+    deptSel.addEventListener('change', function () {
+        empSel.value = '';
+        filterEmps();
+    });
+
+    // Run on init for edit mode
+    if (orgSel.value) filterLocs();
+    if (locSel.value) filterDepts();
+    if (deptSel.value) filterEmps();
+}
+
+// Requestor Cascade
+setupCascade(
+    document.getElementById('reqOrganizationSelect'),
+    document.getElementById('reqLocationSelect'),
+    document.getElementById('reqDepartmentSelect'),
+    document.getElementById('reqEmployeeSelect')
+);
+
+// Target Cascade
+setupCascade(
+    document.getElementById('targetOrganizationSelect'),
+    document.getElementById('targetLocationSelect'),
+    document.getElementById('targetDepartmentSelect'),
+    document.getElementById('targetEmployeeSelect')
+);
+
+function removeAttachment(button) {
+    const attachmentBox = button.closest('.attachment-box');
+    const attachmentId = attachmentBox.dataset.attachmentId;
+
+    if (!attachmentId) {
+        return;
+    }
+
+    // Hide/remove from screen
+    attachmentBox.remove();
+
+    // Add attachment ID to hidden fields
+    const hiddenInput = document.createElement('input');
+
+    hiddenInput.type = 'hidden';
+    hiddenInput.name = 'delete_attachments[]';
+    hiddenInput.value = attachmentId;
+
+    document.getElementById('deletedAttachments').appendChild(hiddenInput);
+}
+</script>
+</body>
+</html>
