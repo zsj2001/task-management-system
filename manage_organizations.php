@@ -175,29 +175,6 @@ $organizations = $pdo->query("SELECT * FROM organization ORDER BY oName ASC")->f
             </tbody>
         </table>
     </div>
-
-    <table>
-        <thead>
-            <tr>
-                <th>task no</th>
-                <th>title</th>
-                <th>desc</th>
-            </tr>
-        </thead>
-        <tbody>
-            <?php if (empty($tasks)): ?>
-                <tr><td colspan="3" style="text-align: center;">No tasks found.</td></tr>
-            <?php else: ?>
-                <?php foreach ($tasks as $task): ?>
-                    <tr>
-                        <td><?= ($task['tNo']) ?></td>    
-                        <td><?= ($task['tTitle']) ?></td>
-                        <td><?= ($task['tDesc']) ?></td>
-                    </tr>
-                <?php endforeach; ?>
-            <?php endif; ?>        
-        </tbody>
-    </table>
 </div>
 </body>
 </html>
