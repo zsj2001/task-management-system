@@ -6,3 +6,5 @@ view task API = view.php
 create task API = submit.php
 task record API = listing.php
 task_detail.php API = action.php
+
+Create uploads folder in the directory to store uploaded pictures
