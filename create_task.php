@@ -3,6 +3,71 @@ session_start();
 
 require_once 'db.php';
 
+function uploadImages($pdo, $tID, $eID) {
+    $count = 0; // how many images were saved. Starts with zero.
+
+    if (!isset($_FILES['attachments'])) {
+        return 0;
+    }
+
+    $allowed = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/gif' => 'gif', 'image/webp' => 'webp'];
+    $uploadDir = __DIR__ . '/uploads/';
+
+    if (!is_dir($uploadDir)) {
+        mkdir($uploadDir, 0755, true);
+    }
+
+    $total = count($_FILES['attachments']['name']); // Counts how many file slots were sent. With multiple, PHP gives a list of names, so this is the length of that list.
+
+    for ($i = 0; $i < $total; $i++) { // $i is file position
+        // If this slot is empty, skip and go to the next one.
+        if ($_FILES['attachments']['error'][$i] == UPLOAD_ERR_NO_FILE) {
+            continue;
+        }
+
+        // If reports any other upload problem for the file, show error message. e.g.: large file, internet connection issue
+        if ($_FILES['attachments']['error'][$i] != UPLOAD_ERR_OK) {
+            throw new Exception('There was an error uploading the image.');
+        }
+
+        if ($_FILES['attachments']['size'][$i] > 5 * 1024 * 1024) {
+            throw new Exception('Each image must not exceed 5 MB.');
+        }
+
+        $tmp = $_FILES['attachments']['tmp_name'][$i];
+        $finfo = new finfo(FILEINFO_MIME_TYPE); /* new finfo(FILEINFO_MIME_TYPE) creates a file inspector. FILEINFO_MIME_TYPE option tells it to give just the MIME type, like image/png */
+        $mimeType = $finfo->file($tmp); // $finfo->file($tmp) makes the inspector look at the uploaded file. It returns the MIME type as text, for example "image/png", and store it in $mimeType
+
+        if (!isset($allowed[$mimeType])) {
+            throw new Exception('Only JPG, PNG, GIF, and WebP image files are allowed.');
+        }
+
+        if (@getimagesize($tmp) === false) {
+            throw new Exception('One of the files is not a valid image.');
+        }
+
+        $fileName = bin2hex(random_bytes(8)) . '.' . $allowed[$mimeType];
+
+        if (!move_uploaded_file($tmp, $uploadDir . $fileName)) {
+            throw new Exception('Failed to save the uploaded image.');
+        }
+
+        $stmt = $pdo->prepare("
+            INSERT INTO task_attachment(tID, uploaded_by_eID, file_name, uploaded_at)
+            VALUES(:tID, :eID, :file_name, NOW())
+        ");
+        $stmt->execute([
+            'tID'       => $tID,
+            'eID'       => $eID,
+            'file_name' => $fileName
+        ]);
+
+        $count++; // Adds to the counter after each saved image
+    }
+
+    return $count;
+}
+
 $message = '';
 $error = '';
 
@@ -180,74 +245,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             // Handle Attachment Upload for Edit
-            if (isset($_FILES['attachment']) && $_FILES['attachment']['error'] !== UPLOAD_ERR_NO_FILE) {
-                $file = $_FILES['attachment'];
-
-                // Check upload error
-                if ($file['error'] !== UPLOAD_ERR_OK) {
-                    throw new Exception('There was an error uploading the image.');
-                }
-
-                // Maximum file size = 5 MB
-                $maxFileSize = 5 * 1024 * 1024;
-                if ($file['size'] > $maxFileSize) {
-                    throw new Exception('Image size must not exceed 5 MB.');
-                }
-
-                // Allowed MIME types
-                $allowedMimeTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-
-                // Detect actual MIME type
-                $finfo = new finfo(FILEINFO_MIME_TYPE);
-                $mimeType = $finfo->file($file['tmp_name']);
-
-                // Check MIME type
-                if (!in_array($mimeType, $allowedMimeTypes, true)) {
-                    throw new Exception('Only JPG, PNG, GIF, and WebP image files are allowed.');
-                }
-
-                // Verify actual image
-                if (@getimagesize($file['tmp_name']) === false) {
-                    throw new Exception('The uploaded file is not a valid image.');
-                }
-
-                // Create upload directory
-                $uploadDir = __DIR__ . '/uploads/';
-                if (!is_dir($uploadDir)) {
-                    if (!mkdir($uploadDir, 0755, true)) {
-                        throw new Exception('Unable to create upload directory.');
-                    }
-                }
-
-                // Generate filename
-                $finfo = new finfo(FILEINFO_MIME_TYPE);
-                $mimeType = $finfo->file($file['tmp_name']);
-
-                $mimeToExtension = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/gif' => 'gif', 'image/webp' => 'webp'];
-
-                if (!isset($mimeToExtension[$mimeType])) {
-                    throw new Exception('Only JPG, PNG, GIF, and WebP image files are allowed.');
-                }
-                $fileName = bin2hex(random_bytes(4)) . '.' . $mimeToExtension[$mimeType];
-                $targetFilePath = $uploadDir . $fileName;
-
-                // Move uploaded file
-                if (!move_uploaded_file($file['tmp_name'], $targetFilePath)) {
-                    throw new Exception('Failed to save the uploaded image.');
-                }
-
-                // Save attachment in database
-                $stmtAtt = $pdo->prepare("
-                    INSERT INTO task_attachment(tID, uploaded_by_eID, file_name, uploaded_at)
-                    VALUES(:tID, :eID, :file_name, NOW())
-                ");
-
-                $stmtAtt->execute([
-                    'tID'       => $tID,
-                    'eID'       => $creator_eID,
-                    'file_name' => $fileName
-                ]);
-            }
+            uploadImages($pdo, $tID, $creator_eID);
 
             $pdo->commit();
             $_SESSION['success_message'] = 'Task Updated Successfully';
@@ -310,73 +308,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
 
             // Handle File Uploads for Create
-            if (isset($_FILES['attachment']) && $_FILES['attachment']['error'] !== UPLOAD_ERR_NO_FILE) {
-                $file = $_FILES['attachment'];
+            $upload = uploadImages($pdo, $tID, $creator_eID);
 
-                // Check upload error
-                if ($file['error'] !== UPLOAD_ERR_OK) {
-                    throw new Exception('There was an error uploading the image.');
-                }
-
-                // Maximum file size = 5 MB
-                $maxFileSize = 5 * 1024 * 1024;
-                if ($file['size'] > $maxFileSize) {
-                    throw new Exception('Image size must not exceed 5 MB.');
-                }
-
-                // Allowed MIME types
-                $allowedMimeTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-
-                // Detect actual MIME type
-                $finfo = new finfo(FILEINFO_MIME_TYPE);
-                $mimeType = $finfo->file($file['tmp_name']);
-
-                // Check MIME type
-                if (!in_array($mimeType, $allowedMimeTypes, true)) {
-                    throw new Exception('Only JPG, PNG, GIF, and WebP image files are allowed.');
-                }
-
-                // Verify actual image
-                if (@getimagesize($file['tmp_name']) === false) {
-                    throw new Exception('The uploaded file is not a valid image.');
-                }
-
-                // Create upload directory
-                $uploadDir = __DIR__ . '/uploads/';
-                if (!is_dir($uploadDir)) {
-                    if (!mkdir($uploadDir, 0755, true)) {
-                        throw new Exception('Unable to create upload directory.');
-                    }
-                }
-
-                // Generate filename
-                $finfo = new finfo(FILEINFO_MIME_TYPE);
-                $mimeType = $finfo->file($file['tmp_name']);
-
-                $mimeToExtension = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/gif' => 'gif', 'image/webp' => 'webp'];
-
-                if (!isset($mimeToExtension[$mimeType])) {
-                    throw new Exception('Only JPG, PNG, GIF, and WebP image files are allowed.');
-                }
-                $fileName = bin2hex(random_bytes(4)) . '.' . $mimeToExtension[$mimeType];
-                $targetFilePath = $uploadDir . $fileName;
-
-                // Move uploaded file
-                if (!move_uploaded_file($file['tmp_name'], $targetFilePath)) {
-                    throw new Exception('Failed to save the uploaded image.');
-                }
-
-                // Save attachment in database
-                $stmtAtt = $pdo->prepare("
-                    INSERT INTO task_attachment(tID, uploaded_by_eID, file_name, uploaded_at)
-                    VALUES(:tID, :eID, :file_name, NOW())
-                ");
-
-                $stmtAtt->execute([
-                    'tID'       => $tID,
-                    'eID'       => $creator_eID,
-                    'file_name' => $fileName
-                ]);
+            if ($upload == 0) {
+                throw new Exception('Please upload at least one image.');
             }
 
             $pdo->commit();
@@ -673,31 +608,35 @@ document.getElementById('createTaskForm').addEventListener('submit', function(e)
     });
 
     // Client-side image validation
-    const fileInput = document.querySelector('input[name="attachment"]');
+    const fileInput = document.querySelector('input[name="attachments[]"]'); // Finds file input on the page so can read what the user picked
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+    const maxSize = 5 * 1024 * 1024;
 
-    if (fileInput && fileInput.files && fileInput.files.length > 0) {
-        const file = fileInput.files[0];
-        const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp' ];
-        const maxSize = 5 * 1024 * 1024;
+    if (fileInput && fileInput.files.length > 0) { // check if input exists and picked at least one file. files[0]
+        for (let i = 0; i < fileInput.files.length; i++) { // files[1], files[2],...
+            const file = fileInput.files[i];
 
-        // Check file type
-       if (!allowedTypes.includes(file.type)) {
-            fileInput.classList.add('is-invalid');
-            hasError = true;
-            alert('Only JPG, PNG, GIF, and WebP image files are allowed.');
-        }
+            if (!allowedTypes.includes(file.type)) {
+                input.classList.add('is-invalid'); // adds CSS class named is-invalid to the input. it gives the input a red border and a light red background
+                hasError = true;
+                alert(file.name + ' is not allowed. Only JPG, PNG, GIF, and WebP image files are allowed.');
+                break;
+            }
 
-        // Check file size
-        if (file.size > maxSize) {
-            fileInput.classList.add('is-invalid');
-            hasError = true;
-            alert('Image size must not exceed 5 MB.');
+            if (file.size > maxSize) {
+                fileInput.classList.add('is-invalid');
+                hasError = true;
+                alert(file.name + ' exceeds 5 MB.');
+                break;
+            }
         }
     }
 
     if (hasError) {
         e.preventDefault();
-        if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
+        /*e.preventDefault() cancels browser’s default action for that event. For a form submit, the default action is to send the form to the server. 
+        When there’s an error, we call preventDefault() so the form is not sent. User stays on the page, sees the red fields. Without it, the form would go to the server even when the data is wrong*/
+        if (fileInput.files.length === 0) {
             alert('All required fields must be filled out.');
         }
     }
