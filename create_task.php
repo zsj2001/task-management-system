@@ -46,7 +46,33 @@ function uploadImages($pdo, $tID, $eID) {
             throw new Exception('One of the files is not a valid image.');
         }
 
-        $fileName = bin2hex(random_bytes(8)) . '.' . $allowed[$mimeType];
+        // Check for duplicate images already attached to this task
+        $newImageHash = hash_file('sha256', $tmp);
+
+        $stmtExisting = $pdo->prepare("
+            SELECT file_name
+            FROM task_attachment
+            WHERE tID = :tID
+        ");
+        $stmtExisting->execute(['tID' => $tID]);
+
+        $existingFiles = $stmtExisting->fetchAll();
+
+        foreach ($existingFiles as $existingFile) {
+            $existingPath = $uploadDir . basename($existingFile);
+
+            if (!is_file($existingPath)) {
+                continue;
+            }
+
+            $existingImageHash = hash_file('sha256', $existingPath);
+
+            if ($existingImageHash !== false && $newImageHash !== false && hash_equals($existingImageHash, $newImageHash)) {
+                throw new Exception('This photo has already been attached to this task.');
+            }
+        }
+
+        $fileName = bin2hex(random_bytes(4)) . '.' . $allowed[$mimeType];
 
         if (!move_uploaded_file($tmp, $uploadDir . $fileName)) {
             throw new Exception('Failed to save the uploaded image.');
