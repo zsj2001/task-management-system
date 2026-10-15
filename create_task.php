@@ -46,29 +46,26 @@ function uploadImages($pdo, $tID, $eID) {
             throw new Exception('One of the files is not a valid image.');
         }
 
-        // Check for duplicate images already attached to this task
-        $newImageHash = hash_file('sha256', $tmp);
+        // Get the hash of the new uploaded file
+        $new_hash = hash_file('sha256', $tmp);
 
-        $stmtExisting = $pdo->prepare("
-            SELECT file_name
-            FROM task_attachment
-            WHERE tID = :tID
-        ");
-        $stmtExisting->execute(['tID' => $tID]);
+        // Get all attachments for this task from the database
+        $get_files = $pdo->prepare("SELECT file_name FROM task_attachment WHERE tID = :tID");
+        $get_files->execute(['tID' => $tID]);
+        $files = $get_files->fetchAll(PDO::FETCH_COLUMN);
 
-        $existingFiles = $stmtExisting->fetchAll();
+        // Loop through each file to see if it's a duplicate
+        foreach ($files as $file) {
+            $full_path = $uploadDir . basename($file);
 
-        foreach ($existingFiles as $existingFile) {
-            $existingPath = $uploadDir . basename($existingFile);
-
-            if (!is_file($existingPath)) {
-                continue;
-            }
-
-            $existingImageHash = hash_file('sha256', $existingPath);
-
-            if ($existingImageHash !== false && $newImageHash !== false && hash_equals($existingImageHash, $newImageHash)) {
-                throw new Exception('This photo has already been attached to this task.');
+            // Make sure the file actually exists on the server first
+            if (file_exists($full_path)) {
+                $current_hash = hash_file('sha256', $full_path);
+                
+                // Compare the hashes to see if they match
+                if ($current_hash === $new_hash) {
+                    throw new Exception("This photo has already been attached to this task.");
+                }
             }
         }
 
