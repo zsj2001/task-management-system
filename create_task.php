@@ -20,12 +20,12 @@ function uploadImages($pdo, $tID, $eID) {
     $total = count($_FILES['attachments']['name']); // Counts how many file slots were sent. With multiple, PHP gives a list of names, so this is the length of that list.
 
     for ($i = 0; $i < $total; $i++) { // $i is file position
-        // If this slot is empty, skip and go to the next one.
+        // If the slot is empty, skip and go to the next one.
         if ($_FILES['attachments']['error'][$i] == UPLOAD_ERR_NO_FILE) {
             continue;
         }
 
-        // If reports any other upload problem for the file, show error message. e.g.: large file, internet connection issue
+        // If got file upload problem, show error message. e.g.: large file, internet connection issue
         if ($_FILES['attachments']['error'][$i] != UPLOAD_ERR_OK) {
             throw new Exception('There was an error uploading the image.');
         }
@@ -35,14 +35,14 @@ function uploadImages($pdo, $tID, $eID) {
         }
 
         $tmp = $_FILES['attachments']['tmp_name'][$i];
-        $finfo = new finfo(FILEINFO_MIME_TYPE); /* new finfo(FILEINFO_MIME_TYPE) creates a file inspector. FILEINFO_MIME_TYPE option tells it to give just the MIME type, like image/png */
-        $mimeType = $finfo->file($tmp); // $finfo->file($tmp) makes the inspector look at the uploaded file. It returns the MIME type as text, for example "image/png", and store it in $mimeType
+        $finfo = new finfo(FILEINFO_MIME_TYPE); // creates a File Information tool and saves into $finfo. FILEINFO_MIME_TYPE option tells it to accept only the MIME type, like image/png
+        $mimeType = $finfo->file($tmp); // tell the tool to open and inspect the created file, ->file() function looks inside the actual binary data to find out what it truly is
 
         if (!isset($allowed[$mimeType])) {
             throw new Exception('Only JPG, PNG, GIF, and WebP image files are allowed.');
         }
 
-        if (@getimagesize($tmp) === false) {
+        if (getimagesize($tmp) === false) {
             throw new Exception('One of the files is not a valid image.');
         }
 
@@ -62,7 +62,7 @@ function uploadImages($pdo, $tID, $eID) {
             'file_name' => $fileName
         ]);
 
-        $count++; // Adds to the counter after each saved image
+        $count++; // Adds counter after each saved image
     }
 
     return $count;
@@ -309,9 +309,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             // Handle File Uploads for Create
             $upload = uploadImages($pdo, $tID, $creator_eID);
-
-            if ($upload == 0) {
-                throw new Exception('Please upload at least one image.');
+            if($upload == 0) {
+                throw new Exception ('Upload at least one file.');
             }
 
             $pdo->commit();
@@ -363,7 +362,7 @@ $employees = $pdo->query("SELECT e.eID, e.eName, e.deptID, d.lID, p.pID
         .target-field {  min-width: 0; }
         .target-field label { font-weight: bold; margin-bottom: 8px; }
         .target-field select {width: 100%; }
-        .existing-attachments { display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 15px; }
+        .existing-attachments { display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 15px; margin-top: 10px; }
         .attachment-preview { width: 100%; height: 100%; object-fit: contain; display: block; }
         .attachment-box { position: relative; width: 150px; height: 120px; border: 1px solid #ccc; border-radius: 5px; background: #f8f9fa; overflow: hidden; }
         .remove-attachment { position: absolute; top: 5px; right: 5px; z-index: 10; 
@@ -572,7 +571,8 @@ $employees = $pdo->query("SELECT e.eID, e.eName, e.deptID, d.lID, p.pID
             <?php endif; ?>
 
             <div id="deletedAttachments"></div>
-            <input type="file" name="attachment" accept="image/jpeg,image/png,image/gif,image/webp"<?= $isEdit ? '' : 'required' ?>>
+            <input type="file" name="attachments[]" id="attachments" accept="image/jpeg,image/png,image/gif,image/webp" multiple<?= $isEdit ? '' : 'required' ?>>
+            <div id="fileList" class="existing-attachments"></div>
             <small style="display:block; margin-top:5px; color:#666;">Allowed file: .jpg, .jpeg, .png, .gif, .webp. Maximum 5 MB.</small>
         </div>
 
@@ -584,6 +584,77 @@ $employees = $pdo->query("SELECT e.eID, e.eName, e.deptID, d.lID, p.pID
 </div>
 
 <script>
+// when choose more than 1 file, keep previous file
+const attachmentInput = document.querySelector('input[name="attachments[]"]'); // show the file input on the page and stores it in attachmentInput, so that can read and remove it.
+const fileListDiv = document.getElementById('fileList'); // placeholder for <div id="fileList"></div>
+let selectedFiles = [];
+
+attachmentInput.addEventListener('change', () => { // Tell browser to listen for change event on the file input, which happens when user done picking the files. When that happens, it triggers () =>, which contains the logic to validate the files and update the list
+    // add newly picked files to the list
+    for (let i = 0; i < attachmentInput.files.length; i++) {
+    if (selectedFiles.length >= 3) {
+        alert('Upload 3 files only');
+        break;
+    }    
+    const newFile = attachmentInput.files[i];
+        let alreadyAdded = false;
+
+        // skip if same file was already picked
+        for (let j = 0; j < selectedFiles.length; j++) {
+            if (selectedFiles[j].name === newFile.name && selectedFiles[j].size === newFile.size) {
+                alreadyAdded = true;
+            }
+        }
+
+        if (!alreadyAdded) {
+            selectedFiles.push(newFile);
+        }
+    }
+
+    updateFileInput();
+    showFileList();
+});
+
+// Put the kept files back into the file input so they are submitted
+function updateFileInput() {
+    const dt = new DataTransfer();
+
+    for (let i = 0; i < selectedFiles.length; i++) {
+        dt.items.add(selectedFiles[i]); // Put every files into the array
+    }
+
+    attachmentInput.files = dt.files;
+    // Hands the full array to the real file input. Without it, the form would only send the last files picked, because the input would still hold just those.
+}
+
+// Show the selected file with a remove button
+function showFileList() {
+    fileListDiv.innerHTML = ''; // build a box to add new item
+
+    for (let i = 0; i < selectedFiles.length; i++) {
+        const box = document.createElement('box'); // create box for image
+        box.className = 'attachment-box';
+
+        const img = document.createElement('img'); // create frame for image
+        img.className = 'attachment-preview';
+        img.src = URL.createObjectURL(selectedFiles[i]); // show image
+
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'remove-attachment';
+        removeBtn.innerHTML = '&times';
+        removeBtn.addEventListener('click', () => {
+            selectedFiles.splice(i, 1); // Removes file from list. splice(i, 1) means "at position i, remove 1 item"
+            updateFileInput();
+            showFileList();
+        });
+        
+        box.appendChild(removeBtn); // add remove button inside box
+        box.appendChild(img);
+        fileListDiv.appendChild(box);
+    }
+}
+
 document.getElementById('createTaskForm').addEventListener('submit', function(e) {
     const requiredInputs = this.querySelectorAll('[required]');
     let hasError = false;
@@ -635,7 +706,7 @@ document.getElementById('createTaskForm').addEventListener('submit', function(e)
     if (hasError) {
         e.preventDefault();
         /*e.preventDefault() cancels browser’s default action for that event. For a form submit, the default action is to send the form to the server. 
-        When there’s an error, we call preventDefault() so the form is not sent. User stays on the page, sees the red fields. Without it, the form would go to the server even when the data is wrong*/
+        When there’s an error, call preventDefault() so the form is not sent. User stays on the page, sees the red fields. Without it, the form would go to the server even when the data is wrong*/
         if (fileInput.files.length === 0) {
             alert('All required fields must be filled out.');
         }
