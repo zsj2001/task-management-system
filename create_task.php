@@ -46,7 +46,8 @@ function uploadImages($pdo, $tID, $eID) {
             throw new Exception('One of the files is not a valid image.');
         }
 
-        // Get the hash of the new uploaded file
+        /* Get the hash of the new uploaded file
+           create hash for newly uploaded file -> compare with current file hash -> if differ, upload, else reject */
         $new_hash = hash_file('sha256', $tmp);
 
         // Get all attachments for this task from the database
@@ -69,7 +70,8 @@ function uploadImages($pdo, $tID, $eID) {
             }
         }
 
-        $fileName = bin2hex(random_bytes(4)) . '.' . $allowed[$mimeType];
+
+        $fileName = bin2hex(random_bytes(8)) . '.' . $allowed[$mimeType];
 
         if (!move_uploaded_file($tmp, $uploadDir . $fileName)) {
             throw new Exception('Failed to save the uploaded image.');
@@ -397,6 +399,8 @@ $employees = $pdo->query("SELECT e.eID, e.eName, e.deptID, d.lID, p.pID
             display: flex; align-items: center; justify-content: center; 
         }
         .remove-attachment:hover { background: #b02a37; }
+        input[type="file"] {font-size:0;}
+        input[type="file"]::file-selector-button{font-size: 14px;}
         @media (max-width: 900px) { .target-row { grid-template-columns: repeat(2, 1fr); gap: 15px; } }
         @media (max-width: 600px) { .target-row { grid-template-columns: 1fr; gap: 15px; }
 }
@@ -410,7 +414,7 @@ $employees = $pdo->query("SELECT e.eID, e.eName, e.deptID, d.lID, p.pID
 <div class="card">
     <?php if ($error): ?><p class="error"><?= htmlspecialchars($error) ?></p><?php endif; ?>
 
-    <form id="createTaskForm" method="POST" enctype="multipart/form-data" novalidate>
+    <form id="createTaskForm" method="POST" enctype="multipart/form-data" novalidate> <!-- since it has custom validation in js, novalidate tells browser not to check if the input fields are filled before sending the data -->
         <div class="form-group">
             <label>Requestor:</label>
             <div class="target-row">
@@ -624,7 +628,7 @@ attachmentInput.addEventListener('change', () => { // Tell browser to listen for
 
         // skip if same file was already picked
         for (let j = 0; j < selectedFiles.length; j++) {
-            if (selectedFiles[j].name === newFile.name && selectedFiles[j].size === newFile.size) {
+            if (selectedFiles[j].size === newFile.size) {
                 alreadyAdded = true;
             }
         }
