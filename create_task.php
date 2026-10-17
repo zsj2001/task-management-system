@@ -47,12 +47,13 @@ function uploadImages($pdo, $tID, $eID) {
         }
 
         /* Get the hash of the new uploaded file
-           create hash for newly uploaded file -> compare with current file hash -> if differ, upload, else reject */
+        Image uploaded (PHP store image temporarily) -> Calculate SHA-256 hash and store in $new_hash -> Retrieve existing attachment filename with same task ID -> calculate existing image file hash -> if differ, upload. Else reject */
         $new_hash = hash_file('sha256', $tmp);
+        // hash_file() reads file and calculates the unique string based on the image file contents.
 
         // Get all attachments for this task from the database
         $get_files = $pdo->prepare("SELECT file_name FROM task_attachment WHERE tID = :tID");
-        $get_files->execute(['tID' => $tID]);
+        $get_files->execute(['tID' => $tID]); // $tID = ID of the task currently being created or edited.
         $files = $get_files->fetchAll(PDO::FETCH_COLUMN);
 
         // Loop through each file to see if it's a duplicate
@@ -61,7 +62,7 @@ function uploadImages($pdo, $tID, $eID) {
 
             // Make sure the file actually exists on the server first
             if (file_exists($full_path)) {
-                $current_hash = hash_file('sha256', $full_path);
+                $current_hash = hash_file('sha256', $full_path); // calculates the SHA-256 hash of the existing image on the server
                 
                 // Compare the hashes to see if they match
                 if ($current_hash === $new_hash) {
@@ -69,7 +70,6 @@ function uploadImages($pdo, $tID, $eID) {
                 }
             }
         }
-
 
         $fileName = bin2hex(random_bytes(8)) . '.' . $allowed[$mimeType];
 
